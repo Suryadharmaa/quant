@@ -1,0 +1,706 @@
+import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from “react”;
+import {
+ScatterChart, Scatter, LineChart, Line, BarChart, Bar,
+XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+Cell, ReferenceLine, AreaChart, Area
+} from “recharts”;
+
+const C = {
+bg:”#050810”,surface:”#080D1A”,panel:”#0B1221”,border:”#131E35”,
+dimText:”#2E4870”,midText:”#4A6899”,bodyText:”#8AABCC”,hiText:”#C4DEFF”,white:”#EAF4FF”,
+regimes:[”#00FFA3”,”#FF3E5F”,”#FFD200”,”#5B8FFF”,”#FF6B35”,”#B44FFF”],
+green:”#00FFA3”,red:”#FF3E5F”,yellow:”#FFD200”,blue:”#5B8FFF”,purple:”#B44FFF”,orange:”#FF6B35”,
+};
+const REGIME_CHARS=[
+{name:“Bull Quiet”,icon:“↗”,desc:“Low vol, positive drift”},
+{name:“Bear Crisis”,icon:“↘”,desc:“High vol, negative returns”},
+{name:“Volatile Bull”,icon:“⚡”,desc:“High vol, positive trend”},
+{name:“Recovery”,icon:“◎”,desc:“Mean-reverting, low drawdown”},
+{name:“Sideways Chop”,icon:“↔”,desc:“Flat drift, moderate vol”},
+{name:“Melt-Up”,icon:“★”,desc:“Extreme positive momentum”},
+];
+const GROQ_MODELS=[
+{id:“llama-3.3-70b-versatile”,label:“LLaMA 3.3 70B”},
+{id:“llama-3.1-8b-instant”,label:“LLaMA 3.1 8B Fast”},
+{id:“mixtral-8x7b-32768”,label:“Mixtral 8x7B”},
+{id:“gemma2-9b-it”,label:“Gemma 2 9B”},
+];
+const ASSET_SEEDS={BTC:42,SPY:99,ETH:7,QQQ:13,GLD:31};
+const FEAT_KEYS=[“return”,“vol60”,“drawdown”,“mom20”,“skewness”,“kurtosis”];
+const FEAT_NICE=[“Return”,“Vol60”,“Drawdown”,“Mom20”,“Skewness”,“Kurtosis”];
+const SCHEDULES={
+BTC:[{v:0.013,d:0.0009,l:70},{v:0.032,d:-0.0025,l:55},{v:0.028,d:0.0018,l:65},{v:0.016,d:0.0012,l:90},{v:0.011,d:0.0003,l:55},{v:0.030,d:-0.0015,l:45},{v:0.022,d:0.0010,l:75},{v:0.009,d:0.0005,l:60},{v:0.035,d:0.0022,l:40},{v:0.014,d:0.0007,l:80}],
+SPY:[{v:0.008,d:0.0006,l:90},{v:0.020,d:-0.0012,l:60},{v:0.015,d:0.0010,l:70},{v:0.010,d:0.0008,l:100},{v:0.007,d:0.0004,l:80},{v:0.022,d:-0.0008,l:40},{v:0.012,d:0.0007,l:90},{v:0.006,d:0.0003,l:70}],
+ETH:[{v:0.018,d:0.0012,l:65},{v:0.040,d:-0.003,l:50},{v:0.035,d:0.002,l:60},{v:0.020,d:0.0015,l:80},{v:0.014,d:0.0004,l:60},{v:0.038,d:-0.002,l:40},{v:0.025,d:0.0013,l:70},{v:0.012,d:0.0006,l:75}],
+QQQ:[{v:0.010,d:0.0008,l:80},{v:0.025,d:-0.0015,l:55},{v:0.018,d:0.0012,l:75},{v:0.012,d:0.0009,l:95},{v:0.008,d:0.0005,l:70},{v:0.026,d:-0.001,l:45},{v:0.015,d:0.0008,l:80},{v:0.007,d:0.0004,l:60}],
+GLD:[{v:0.007,d:0.0004,l:100},{v:0.015,d:-0.0008,l:50},{v:0.010,d:0.0006,l:80},{v:0.008,d:0.0005,l:110},{v:0.006,d:0.0002,l:90},{v:0.016,d:-0.0005,l:40},{v:0.009,d:0.0004,l:80},{v:0.005,d:0.0002,l:70}],
+};
+
+function mkRng(seed){let s=seed;return()=>{s^=s<<13;s^=s>>17;s^=s<<5;return(s>>>0)/4294967296;};}
+function mkRandn(rng){return()=>{let u=0,v=0;while(!u)u=rng();while(!v)v=rng();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};}
+
+function generateMarketData(asset,n=500){
+const rng=mkRng(ASSET_SEEDS[asset]||42);
+const randn=mkRandn(rng);
+const schedule=SCHEDULES[asset]||SCHEDULES.BTC;
+let price=asset===“BTC”?100:asset===“ETH”?50:200;
+const prices=[price];
+let day=0;
+for(const r of schedule){for(let i=0;i<r.l&&day<n+100;i++,day++){price*=(1+r.d+r.v*randn());prices.push(Math.max(0.01,price));}}
+while(day<n+100){price*=(1+0.0005+0.015*randn());prices.push(Math.max(0.01,price));day++;}
+const WV=60,WM=20;
+const start=new Date(“2020-01-01”);
+const data=[];
+for(let i=WV;i<prices.length&&data.length<n;i++){
+const ret=(prices[i]-prices[i-1])/prices[i-1];
+const slice=[];
+for(let j=i-WV;j<i;j++)slice.push((prices[j+1]-prices[j])/prices[j]);
+const mu=slice.reduce((a,b)=>a+b,0)/WV;
+const vari=slice.reduce((a,b)=>a+(b-mu)**2,0)/WV;
+const std=Math.sqrt(vari)||0.001;
+const vol=std*Math.sqrt(252);
+const skew=slice.reduce((a,b)=>a+((b-mu)/std)**3,0)/WV;
+const kurt=slice.reduce((a,b)=>a+((b-mu)/std)**4,0)/WV-3;
+const maxP=Math.max(…prices.slice(Math.max(0,i-90),i+1));
+const dd=(prices[i]-maxP)/maxP;
+const mom20=i>=WM?(prices[i]-prices[i-WM])/prices[i-WM]:0;
+const dt=new Date(start.getTime()+(i-WV)*86400000);
+data.push({date:dt.toISOString().split(“T”)[0],price:prices[i],return:ret,vol60:Math.max(0.02,Math.min(2,vol)),drawdown:dd,mom20,skewness:isNaN(skew)?0:Math.max(-3,Math.min(3,skew)),kurtosis:isNaN(kurt)?0:Math.max(-3,Math.min(10,kurt)),absReturn:Math.abs(ret)});
+}
+return data;
+}
+
+function normalize(features){
+const n=features[0].length;
+const means=Array(n).fill(0),stds=Array(n).fill(0);
+features.forEach(f=>f.forEach((v,i)=>{means[i]+=v;}));
+means.forEach((*,i)=>{means[i]/=features.length;});
+features.forEach(f=>f.forEach((v,i)=>{stds[i]+=(v-means[i])**2;}));
+stds.forEach((*,i)=>{stds[i]=Math.sqrt(stds[i]/features.length)||1;});
+return features.map(f=>f.map((v,i)=>(v-means[i])/stds[i]));
+}
+
+function kmeans(features,k,maxIter=150){
+const norm=normalize(features);
+const step=Math.floor(norm.length/k);
+let centers=Array.from({length:k},(*,i)=>[…norm[i*step]]);
+let labels=new Array(norm.length).fill(0);
+for(let iter=0;iter<maxIter;iter++){
+const nl=norm.map(f=>{let best=0,bestD=Infinity;centers.forEach((c,ci)=>{const d=Math.sqrt(f.reduce((s,v,i)=>s+(v-c[i])**2,0));if(d<bestD){bestD=d;best=ci;}});return best;});
+centers=Array.from({length:k},(*,c)=>{const pts=norm.filter((*,i)=>nl[i]===c);if(!pts.length)return centers[c];return pts[0].map((*,j)=>pts.reduce((s,p)=>s+p[j],0)/pts.length);});
+if(nl.every((l,i)=>l===labels[i]))break;
+labels=nl;
+}
+const inertia=norm.reduce((s,f,i)=>{const c=centers[labels[i]];return s+f.reduce((ss,v,j)=>ss+(v-c[j])**2,0);},0);
+const rs=Array.from({length:k},(*,c)=>{const pts=features.filter((*,i)=>labels[i]===c);return{c,avgVol:pts.length?pts.reduce((s,p)=>s+p[1],0)/pts.length:0};}).sort((a,b)=>a.avgVol-b.avgVol);
+const remap={};rs.forEach((s,i)=>{remap[s.c]=i;});
+return{labels:labels.map(l=>remap[l]),inertia};
+}
+
+function computeElbow(features,maxK=8){
+return Array.from({length:maxK-1},(_,i)=>{const k=i+2;const{inertia}=kmeans(features,k,80);return{k,inertia};});
+}
+
+function computeRegimeStats(data,k){
+const result=[];
+for(let c=0;c<k;c++){
+const pts=data.filter(d=>d.regime===c);
+if(!pts.length)continue;
+const rets=pts.map(d=>d.return);
+const n=rets.length;
+const mean=rets.reduce((a,b)=>a+b,0)/n;
+const variance=rets.reduce((a,b)=>a+(b-mean)**2,0)/n;
+const std=Math.sqrt(variance)||0.001;
+const annRet=mean*252,annVol=std*Math.sqrt(252);
+const sharpe=annRet/annVol;
+const dr=rets.filter(r=>r<0);
+const dStd=dr.length?Math.sqrt(dr.reduce((a,b)=>a+b**2,0)/dr.length)*Math.sqrt(252):0.001;
+const sortino=annRet/dStd;
+const sorted=[…rets].sort((a,b)=>a-b);
+const var95=sorted[Math.floor(n*0.05)]||0;
+const cvar95=sorted.slice(0,Math.floor(n*0.05)).reduce((a,b)=>a+b,0)/(Math.floor(n*0.05)||1);
+const wins=rets.filter(r=>r>0),losses=rets.filter(r=>r<0);
+const winRate=wins.length/n;
+const avgWin=wins.length?wins.reduce((a,b)=>a+b,0)/wins.length:0;
+const avgLoss=losses.length?losses.reduce((a,b)=>a+b,0)/losses.length:0;
+const maxDD=Math.min(…pts.map(d=>d.drawdown));
+const avgVol=pts.reduce((a,d)=>a+d.vol60,0)/n;
+const calmar=maxDD?annRet/Math.abs(maxDD):0;
+const skew=pts.reduce((a,d)=>a+d.skewness,0)/n;
+const pf=avgLoss?Math.abs(avgWin/avgLoss):99;
+result.push({c,count:n,pct:(n/data.length*100).toFixed(1),annRet:(annRet*100).toFixed(2),annVol:(annVol*100).toFixed(2),sharpe:sharpe.toFixed(3),sortino:sortino.toFixed(3),calmar:calmar.toFixed(3),var95:(var95*100).toFixed(3),cvar95:(cvar95*100).toFixed(3),winRate:(winRate*100).toFixed(1),avgWin:(avgWin*100).toFixed(3),avgLoss:(avgLoss*100).toFixed(3),maxDD:(maxDD*100).toFixed(2),avgVol:(avgVol*100).toFixed(1),skew:skew.toFixed(3),profitFactor:pf>=99?“inf”:pf.toFixed(3)});
+}
+return result;
+}
+
+function computeTransitionMatrix(labels,k){
+const mat=Array.from({length:k},()=>Array(k).fill(0));
+for(let i=1;i<labels.length;i++)mat[labels[i-1]][labels[i]]++;
+return mat.map(row=>{const sum=row.reduce((a,b)=>a+b,0)||1;return row.map(v=>v/sum);});
+}
+
+function computeCumReturns(data){
+let cum=1;
+return data.map(d=>{cum*=(1+d.return);return{date:d.date,cum:(cum-1)*100,regime:d.regime};});
+}
+
+function computeBacktest(data,activeRegimes){
+let strat=1,bh=1;
+const res=[];
+data.forEach((d,i)=>{
+strat*=activeRegimes.has(d.regime)?(1+d.return):1.00008;
+bh*=(1+d.return);
+if(i%5===0)res.push({date:d.date,strategy:(strat-1)*100,buyhold:(bh-1)*100});
+});
+return res;
+}
+
+function computeDurations(data,k){
+const dur=Array.from({length:k},()=>[]);
+let st=0;
+for(let i=1;i<=data.length;i++){if(i===data.length||data[i]?.regime!==data[st].regime){dur[data[st].regime].push(i-st);st=i;}}
+return dur.map((d,c)=>({c,count:d.length,avg:d.length?(d.reduce((a,b)=>a+b,0)/d.length).toFixed(1):“0”,max:d.length?Math.max(…d):0,min:d.length?Math.min(…d):0}));
+}
+
+function corrMatrix(data){
+const feats=[data.map(d=>d.return),data.map(d=>d.vol60),data.map(d=>d.drawdown),data.map(d=>d.mom20),data.map(d=>d.skewness),data.map(d=>d.kurtosis)];
+const means=feats.map(f=>f.reduce((a,b)=>a+b,0)/f.length);
+const stds=feats.map((f,i)=>Math.sqrt(f.reduce((a,b)=>a+(b-means[i])**2,0)/f.length)||1);
+return feats.map((fi,i)=>feats.map((fj,j)=>{const cov=fi.reduce((s,v,k)=>s+(v-means[i])*(fj[k]-means[j]),0)/fi.length;return cov/(stds[i]*stds[j]);}));
+}
+
+function Dot({color,glow,size=8}){return <span style={{display:“inline-block”,width:size,height:size,borderRadius:“50%”,background:color,boxShadow:glow?`0 0 7px ${color}`:undefined,flexShrink:0}}/>;}
+function Tag({label,color}){return <span style={{fontSize:9,letterSpacing:1.5,padding:“2px 7px”,border:`1px solid ${color}44`,borderRadius:3,color,background:`${color}11`,textTransform:“uppercase”}}>{label}</span>;}
+function Panel({children,style}){return <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:10,padding:“16px 18px”,…style}}>{children}</div>;}
+function PanelTitle({children,right}){return(<div style={{display:“flex”,justifyContent:“space-between”,alignItems:“center”,marginBottom:12}}><span style={{fontSize:9,letterSpacing:2.5,color:C.dimText,textTransform:“uppercase”,fontFamily:“monospace”}}>{children}</span>{right}</div>);}
+function Btn({children,onClick,active,color=C.blue,disabled,small}){return(<button onClick={onClick} disabled={disabled} style={{padding:small?“4px 10px”:“7px 14px”,border:`1px solid ${active?color:C.border}`,borderRadius:5,background:active?`${color}18`:“transparent”,color:active?color:C.bodyText,cursor:disabled?“not-allowed”:“pointer”,fontSize:small?9:11,fontFamily:“monospace”,letterSpacing:small?1:0.5,opacity:disabled?0.4:1,transition:“all 0.15s”}}>{children}</button>);}
+function StatCell({label,value,color,sub}){return(<div style={{padding:“10px 12px”,background:C.surface,border:`1px solid ${C.border}`,borderRadius:7}}><div style={{fontSize:9,color:C.dimText,letterSpacing:1.5,marginBottom:4,textTransform:“uppercase”}}>{label}</div><div style={{fontSize:16,fontWeight:700,color:color||C.hiText,fontFamily:“monospace”}}>{value}</div>{sub&&<div style={{fontSize:9,color:C.midText,marginTop:2}}>{sub}</div>}</div>);}
+
+function ScatterTip({active,payload}){
+if(!active||!payload?.length)return null;
+const d=payload[0]?.payload;
+if(!d)return null;
+return(<div style={{background:”#0B1221”,border:`1px solid ${C.regimes[d.regime]||C.blue}`,borderRadius:7,padding:“8px 12px”,fontSize:10,fontFamily:“monospace”,color:C.hiText,minWidth:140}}><div style={{color:C.regimes[d.regime],fontWeight:700,marginBottom:5}}>{REGIME_CHARS[d.regime]?.name||“R”+d.regime}</div>{payload.map((p,i)=><div key={i}>{p.name}: <b>{typeof p.value===“number”?p.value.toFixed(4):p.value}</b></div>)}<div style={{color:C.midText,marginTop:4,fontSize:9}}>{d.date}</div></div>);
+}
+function LineTip({active,payload,label}){
+if(!active||!payload?.length)return null;
+return(<div style={{background:”#0B1221”,border:`1px solid ${C.border}`,borderRadius:7,padding:“8px 12px”,fontSize:10,fontFamily:“monospace”,color:C.hiText}}><div style={{color:C.midText,marginBottom:5,fontSize:9}}>{label}</div>{payload.map((p,i)=><div key={i} style={{color:p.color,marginBottom:2}}>{p.name}: <b>{typeof p.value===“number”?p.value.toFixed(2)+”%”:p.value}</b></div>)}</div>);
+}
+
+function TimelineSVG({data}){
+if(!data.length)return null;
+const W=1000,H=200,PL=55,PR=15,PT=15,PB=28;
+const Wi=W-PL-PR,Hi=H-PT-PB;
+const prices=data.map(d=>d.price);
+const minP=Math.min(…prices),maxP=Math.max(…prices);
+const xS=(i)=>PL+(i/(data.length-1||1))*Wi;
+const yS=(p)=>PT+Hi-((p-minP)/(maxP-minP||1))*Hi;
+const path=data.map((d,i)=>`${i===0?"M":"L"}${xS(i).toFixed(1)},${yS(d.price).toFixed(1)}`).join(” “);
+const bands=[];let st=0;
+for(let i=1;i<=data.length;i++){if(i===data.length||data[i]?.regime!==data[st].regime){bands.push({start:st,end:i-1,regime:data[st].regime});st=i;}}
+const ticks=[];let prevYM=null;
+data.forEach((d,i)=>{const ym=d.date.slice(0,7);if(ym!==prevYM){ticks.push({i,label:d.date.slice(0,7)});prevYM=ym;}});
+const tf=ticks.filter((_,idx)=>idx%4===0);
+const pctLines=[0,0.25,0.5,0.75,1];
+return(
+<svg viewBox={`0 0 ${W} ${H}`} style={{width:“100%”,height:“auto”,display:“block”}}>
+{bands.map((b,idx)=><rect key={idx} x={xS(b.start)} y={PT} width={Math.max(1,xS(b.end)-xS(b.start)+1.5)} height={Hi} fill={C.regimes[b.regime%C.regimes.length]} opacity={0.15}/>)}
+{pctLines.map(v=>{const p=minP+v*(maxP-minP);const y=yS(p);return(<g key={v}><line x1={PL} y1={y} x2={PL+Wi} y2={y} stroke={C.border} strokeWidth={0.5}/><text x={PL-5} y={y+3.5} textAnchor="end" fill={C.dimText} fontSize={8} fontFamily="monospace">{p>=1000?`${(p/1000).toFixed(1)}k`:p.toFixed(1)}</text></g>);})}
+<path d={path} fill="none" stroke={C.hiText} strokeWidth={1.5} opacity={0.9}/>
+{tf.map((t,i)=><g key={i}><line x1={xS(t.i)} y1={PT+Hi} x2={xS(t.i)} y2={PT+Hi+4} stroke={C.dimText} strokeWidth={0.5}/><text x={xS(t.i)} y={H-4} textAnchor="middle" fill={C.dimText} fontSize={8} fontFamily="monospace">{t.label}</text></g>)}
+</svg>
+);
+}
+
+function TransitionMatrix({matrix,k}){
+if(!matrix.length)return null;
+const max=Math.max(…matrix.flat());
+return(
+<div style={{display:“grid”,gridTemplateColumns:`60px repeat(${k},1fr)`,gap:2,fontFamily:“monospace”,fontSize:9}}>
+<div/>
+{Array.from({length:k},(_,c)=><div key={c} style={{textAlign:“center”,color:C.regimes[c],padding:“4px 2px”,letterSpacing:1}}>R{c}</div>)}
+{matrix.map((row,r)=>(
+<Fragment key={r}>
+<div style={{color:C.regimes[r],display:“flex”,alignItems:“center”,gap:5,paddingRight:8}}><Dot color={C.regimes[r]} size={6}/>R{r}</div>
+{row.map((val,c)=>{
+const intensity=max?val/max:0;
+const isMain=r===c;
+return(<div key={c} style={{background:`rgba(${isMain?"0,255,163":"91,143,255"},${intensity*0.75})`,border:`1px solid ${C.border}`,borderRadius:4,display:“flex”,alignItems:“center”,justifyContent:“center”,padding:“7px 4px”,color:intensity>0.4?C.white:C.midText,fontWeight:isMain?700:400,fontSize:10}}>{(val*100).toFixed(0)}%</div>);
+})}
+</Fragment>
+))}
+</div>
+);
+}
+
+function CorrHeatmap({data}){
+const mat=useMemo(()=>corrMatrix(data),[data]);
+const n=FEAT_NICE.length;
+return(
+<div style={{overflowX:“auto”}}>
+<div style={{display:“grid”,gridTemplateColumns:`70px repeat(${n},1fr)`,gap:2,fontSize:8,fontFamily:“monospace”,minWidth:380}}>
+<div/>
+{FEAT_NICE.map(l=><div key={l} style={{textAlign:“center”,color:C.midText,padding:“3px 2px”,fontSize:8}}>{l.slice(0,5)}</div>)}
+{Array.from({length:n},(*,r)=>(
+<Fragment key={r}>
+<div style={{color:C.midText,display:“flex”,alignItems:“center”,paddingRight:6,fontSize:8}}>{FEAT_NICE[r]}</div>
+{Array.from({length:n},(*,c)=>{
+const val=mat[r][c];
+const abs=Math.abs(val);
+const rgb=val>0?“0,255,163”:“255,62,95”;
+return(<div key={c} style={{background:`rgba(${rgb},${abs*0.7})`,border:`1px solid ${C.border}`,borderRadius:3,display:“flex”,alignItems:“center”,justifyContent:“center”,padding:“5px 2px”,color:abs>0.5?C.white:C.midText,fontSize:8}}>{val.toFixed(2)}</div>);
+})}
+</Fragment>
+))}
+</div>
+</div>
+);
+}
+
+export default function App(){
+const [asset,setAsset]=useState(“BTC”);
+const [k,setK]=useState(4);
+const [activeFeats,setActiveFeats]=useState([“return”,“vol60”,“drawdown”,“mom20”]);
+const [data,setData]=useState([]);
+const [tab,setTab]=useState(“overview”);
+const [groqKey,setGroqKey]=useState(””);
+const [groqModel,setGroqModel]=useState(GROQ_MODELS[0].id);
+const [aiMessages,setAiMessages]=useState([]);
+const [aiInput,setAiInput]=useState(””);
+const [aiLoading,setAiLoading]=useState(false);
+const [btRegimes,setBtRegimes]=useState(new Set([0]));
+const [elbow,setElbow]=useState([]);
+const [generating,setGenerating]=useState(false);
+const chatRef=useRef(null);
+
+const run=useCallback((ast,numK,fkeys)=>{
+setGenerating(true);
+setTimeout(()=>{
+const raw=generateMarketData(ast,500);
+const features=raw.map(d=>fkeys.map(f=>d[f]||0));
+const {labels}=kmeans(features,numK);
+const withR=raw.map((d,i)=>({…d,regime:labels[i]}));
+setData(withR);
+setElbow(computeElbow(features));
+setGenerating(false);
+},80);
+},[]);
+
+useEffect(()=>{run(“BTC”,4,[“return”,“vol60”,“drawdown”,“mom20”]);},[]);
+
+const stats=useMemo(()=>computeRegimeStats(data,k),[data,k]);
+const transMat=useMemo(()=>data.length?computeTransitionMatrix(data.map(d=>d.regime),k):[],[data,k]);
+const cumRets=useMemo(()=>computeCumReturns(data),[data]);
+const btResults=useMemo(()=>computeBacktest(data,btRegimes),[data,btRegimes]);
+const durations=useMemo(()=>computeDurations(data,k),[data,k]);
+const scatterData=useMemo(()=>data.map(d=>({x:d.return*100,y:d.vol60*100,regime:d.regime,date:d.date})),[data]);
+
+const toggleFeat=(f)=>setActiveFeats(prev=>{const next=prev.includes(f)?prev.filter(x=>x!==f):[…prev,f];return next.length<2?prev:next;});
+
+const buildContext=()=>{
+const st=stats.map(s=>`R${s.c}(${REGIME_CHARS[s.c]?.name} ${s.pct}%): Ret=${s.annRet}% Vol=${s.annVol}% SR=${s.sharpe} Sortino=${s.sortino} WR=${s.winRate}% MaxDD=${s.maxDD}%`).join(”\n”);
+const tr=transMat.map((row,r)=>`R${r}=>[${row.map((v,c)=>`R${c}:${(v*100).toFixed(0)}%`).join(",")}]`).join(” “);
+return `Asset:${asset} K=${k} Features:${activeFeats.join(",")}\nRegimes:\n${st}\nTransitions:${tr}`;
+};
+
+const sendAI=async(prompt)=>{
+if(!groqKey.trim()){setAiMessages(m=>[…m,{role:“assistant”,content:“Enter your free Groq API key above (console.groq.com).”}]);return;}
+const newMsg={role:“user”,content:prompt};
+const history=[…aiMessages,newMsg];
+setAiMessages(history);setAiInput(””);setAiLoading(true);
+try{
+const resp=await fetch(“https://api.groq.com/openai/v1/chat/completions”,{
+method:“POST”,
+headers:{“Content-Type”:“application/json”,“Authorization”:`Bearer ${groqKey}`},
+body:JSON.stringify({model:groqModel,max_tokens:1200,temperature:0.3,messages:[{role:“system”,content:`You are an elite quantitative analyst. Be precise and actionable.\n\nContext:\n${buildContext()}`},…history.map(m=>({role:m.role,content:m.content}))]})
+});
+const d=await resp.json();
+if(d.error)throw new Error(d.error.message);
+setAiMessages(m=>[…m,{role:“assistant”,content:d.choices?.[0]?.message?.content||“No response”}]);
+}catch(e){setAiMessages(m=>[…m,{role:“assistant”,content:`Error: ${e.message}`}]);}
+setAiLoading(false);
+};
+
+useEffect(()=>{if(chatRef.current)chatRef.current.scrollTop=chatRef.current.scrollHeight;},[aiMessages]);
+
+const TABS=[{id:“overview”,label:“Overview”},{id:“analytics”,label:“Analytics”},{id:“risk”,label:“Risk Metrics”},{id:“features”,label:“Features”},{id:“backtest”,label:“Backtest”},{id:“ai”,label:“AI Console”}];
+const btFinal=btResults.length?(+btResults[btResults.length-1].strategy).toFixed(1):”–”;
+const bhFinal=btResults.length?(+btResults[btResults.length-1].buyhold).toFixed(1):”–”;
+const alpha=btResults.length?(btResults[btResults.length-1].strategy-btResults[btResults.length-1].buyhold).toFixed(1):”–”;
+
+return(
+<div style={{minHeight:“100vh”,background:C.bg,fontFamily:”‘JetBrains Mono’,‘Fira Code’,‘Courier New’,monospace”,color:C.bodyText,fontSize:12}}>
+<div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:“0 24px”,display:“flex”,alignItems:“stretch”,height:46}}>
+<div style={{display:“flex”,alignItems:“center”,gap:10,paddingRight:24,borderRight:`1px solid ${C.border}`}}>
+<Dot color={C.green} glow size={7}/>
+<span style={{fontSize:11,color:C.hiText,fontWeight:700,letterSpacing:0.5}}>QUANT REGIME</span>
+<Tag label="v2" color={C.green}/>
+</div>
+<div style={{display:“flex”,alignItems:“center”,paddingLeft:8,flex:1}}>
+{TABS.map(t=><button key={t.id} onClick={()=>setTab(t.id)} style={{padding:“0 16px”,height:“100%”,border:“none”,background:“transparent”,borderBottom:tab===t.id?`2px solid ${C.blue}`:“2px solid transparent”,color:tab===t.id?C.blue:C.midText,cursor:“pointer”,fontSize:10,fontFamily:“monospace”,letterSpacing:1,textTransform:“uppercase”,transition:“color 0.15s”}}>{t.label}</button>)}
+</div>
+<div style={{display:“flex”,alignItems:“center”,gap:8,paddingLeft:24,borderLeft:`1px solid ${C.border}`,fontSize:9,color:C.dimText}}>
+<span>{asset}</span><span>K={k}</span><span>{data.length}D</span>
+</div>
+</div>
+
+```
+  <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:"10px 24px",display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+    <div style={{display:"flex",gap:4}}>{Object.keys(ASSET_SEEDS).map(a=><Btn key={a} active={asset===a} color={C.green} onClick={()=>{setAsset(a);run(a,k,activeFeats);}}>{a}</Btn>)}</div>
+    <div style={{width:1,height:24,background:C.border}}/>
+    <span style={{fontSize:9,color:C.dimText}}>K:</span>
+    {[2,3,4,5,6].map(n=><Btn key={n} small active={k===n} color={C.regimes[n-2]} onClick={()=>{setK(n);run(asset,n,activeFeats);}}>{n}</Btn>)}
+    <div style={{width:1,height:24,background:C.border}}/>
+    <span style={{fontSize:9,color:C.dimText}}>Features:</span>
+    {FEAT_KEYS.map((f,i)=><Btn key={f} small active={activeFeats.includes(f)} color={C.yellow} onClick={()=>toggleFeat(f)}>{FEAT_NICE[i]}</Btn>)}
+    <div style={{marginLeft:"auto"}}><Btn onClick={()=>run(asset,k,activeFeats)} color={C.midText} small>Recompute</Btn></div>
+  </div>
+
+  <div style={{padding:"16px 24px 40px"}}>
+    {generating?(
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:80,gap:12}}>
+        <div style={{fontSize:11,color:C.dimText,letterSpacing:3}}>COMPUTING CLUSTERS...</div>
+        <div style={{width:200,height:2,background:C.border,borderRadius:1,overflow:"hidden"}}><div style={{height:"100%",background:C.blue,animation:"slide 1.2s linear infinite",width:"40%"}}/></div>
+      </div>
+    ):(
+      <>
+      {tab==="overview"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(160px,1fr))",gap:10}}>
+            {stats.map(s=>(
+              <div key={s.c} style={{background:C.panel,border:`1px solid ${C.regimes[s.c]}30`,borderRadius:9,padding:"12px 14px",borderLeft:`3px solid ${C.regimes[s.c]}`}}>
+                <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:8}}><Dot color={C.regimes[s.c]} glow size={7}/><span style={{fontSize:9,color:C.regimes[s.c],fontWeight:700,letterSpacing:1}}>{REGIME_CHARS[s.c]?.name||"R"+s.c}</span></div>
+                <div style={{fontSize:18,fontWeight:700,color:parseFloat(s.annRet)>=0?C.green:C.red,marginBottom:3}}>{parseFloat(s.annRet)>=0?"+":""}{s.annRet}%</div>
+                <div style={{fontSize:9,color:C.dimText,marginBottom:6}}>Ann. Return</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:4,fontSize:9}}>
+                  <div><span style={{color:C.dimText}}>Vol: </span><b style={{color:C.yellow}}>{s.annVol}%</b></div>
+                  <div><span style={{color:C.dimText}}>SR: </span><b style={{color:C.blue}}>{s.sharpe}</b></div>
+                  <div><span style={{color:C.dimText}}>Time: </span><b style={{color:C.midText}}>{s.pct}%</b></div>
+                  <div><span style={{color:C.dimText}}>WR: </span><b style={{color:C.midText}}>{s.winRate}%</b></div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Panel>
+              <PanelTitle right={<Tag label="K-Means" color={C.blue}/>}>Return vs Volatility</PanelTitle>
+              <ResponsiveContainer width="100%" height={240}>
+                <ScatterChart margin={{top:5,right:5,bottom:0,left:-15}}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="x" name="Return" unit="%" tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}}/>
+                  <YAxis dataKey="y" name="Vol" unit="%" tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}}/>
+                  <Tooltip content={<ScatterTip/>}/>
+                  <ReferenceLine x={0} stroke={C.midText} strokeDasharray="3 2" strokeWidth={1} opacity={0.5}/>
+                  <Scatter data={scatterData} isAnimationActive={false}>
+                    {scatterData.map((d,i)=><Cell key={i} fill={C.regimes[d.regime%C.regimes.length]} opacity={0.65}/>)}
+                  </Scatter>
+                </ScatterChart>
+              </ResponsiveContainer>
+            </Panel>
+            <Panel>
+              <PanelTitle right={<Tag label="Rolling" color={C.purple}/>}>Cumulative Returns</PanelTitle>
+              <ResponsiveContainer width="100%" height={240}>
+                <AreaChart data={cumRets.filter((_,i)=>i%2===0)} margin={{top:5,right:5,bottom:0,left:-15}}>
+                  <defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor={C.green} stopOpacity={0.3}/><stop offset="95%" stopColor={C.green} stopOpacity={0}/></linearGradient></defs>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="date" tick={false}/>
+                  <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}} unit="%"/>
+                  <Tooltip content={<LineTip/>}/>
+                  <ReferenceLine y={0} stroke={C.midText} strokeDasharray="3 2" strokeWidth={1}/>
+                  <Area type="monotone" dataKey="cum" name="Cum Return" stroke={C.green} fill="url(#cg)" strokeWidth={1.5} dot={false} isAnimationActive={false}/>
+                </AreaChart>
+              </ResponsiveContainer>
+            </Panel>
+          </div>
+          <Panel>
+            <PanelTitle right={<div style={{display:"flex",gap:12}}>{Array.from({length:k},(_,c)=><div key={c} style={{display:"flex",alignItems:"center",gap:5}}><Dot color={C.regimes[c]} size={6}/><span style={{fontSize:8,color:C.regimes[c]}}>{REGIME_CHARS[c]?.name||"R"+c}</span></div>)}</div>}>{asset} Price Regime Timeline</PanelTitle>
+            <TimelineSVG data={data}/>
+          </Panel>
+        </div>
+      )}
+
+      {tab==="analytics"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Panel>
+              <PanelTitle right={<Tag label="Markov" color={C.orange}/>}>Regime Transition Matrix</PanelTitle>
+              <TransitionMatrix matrix={transMat} k={k}/>
+              <div style={{marginTop:10,fontSize:9,color:C.dimText}}>Rows = FROM regime · Cols = TO regime · Values = empirical probability</div>
+            </Panel>
+            <Panel>
+              <PanelTitle>Regime Duration Distribution</PanelTitle>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={durations} margin={{top:5,right:5,bottom:0,left:-15}}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="c" tickFormatter={v=>`R${v}`} tick={{fill:C.dimText,fontSize:9,fontFamily:"monospace"}}/>
+                  <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}}/>
+                  <Tooltip content={({active,payload})=>{if(!active||!payload?.length)return null;const d=payload[0]?.payload;return(<div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:6,padding:"8px 12px",fontSize:9,fontFamily:"monospace"}}><div style={{color:C.regimes[d.c],marginBottom:4}}>{REGIME_CHARS[d.c]?.name}</div><div>Avg: <b>{d.avg}d</b></div><div>Max: <b>{d.max}d</b></div><div>Episodes: <b>{d.count}</b></div></div>);}}/>
+                  <Bar dataKey="avg" name="Avg Duration (d)" radius={[3,3,0,0]} isAnimationActive={false}>
+                    {durations.map((d,i)=><Cell key={i} fill={C.regimes[d.c]}/>)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </Panel>
+          </div>
+          <Panel>
+            <PanelTitle>Daily Return Histogram per Regime</PanelTitle>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12}}>
+              {stats.map(s=>{
+                const pts=data.filter(d=>d.regime===s.c);
+                const retsArr=pts.map(d=>d.return*100);
+                const mn=Math.min(...retsArr),mx=Math.max(...retsArr);
+                const bw=(mx-mn)/20||0.1;
+                const buckets=Array(20).fill(0);
+                retsArr.forEach(r=>{const b=Math.min(19,Math.floor((r-mn)/bw));buckets[b]++;});
+                const histData=buckets.map((v,i)=>({x:+(mn+i*bw).toFixed(2),v}));
+                return(
+                  <div key={s.c} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px"}}>
+                    <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:8}}><Dot color={C.regimes[s.c]} size={6}/><span style={{fontSize:9,color:C.regimes[s.c]}}>{REGIME_CHARS[s.c]?.name}</span></div>
+                    <ResponsiveContainer width="100%" height={80}>
+                      <BarChart data={histData} margin={{top:0,right:0,bottom:0,left:-30}}>
+                        <YAxis tick={false}/>
+                        <XAxis dataKey="x" tick={{fill:C.dimText,fontSize:7,fontFamily:"monospace"}} interval={4}/>
+                        <Bar dataKey="v" fill={C.regimes[s.c]} opacity={0.7} isAnimationActive={false}/>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {tab==="risk"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <Panel>
+            <PanelTitle right={<Tag label="Comprehensive" color={C.red}/>}>Full Risk Metrics Matrix</PanelTitle>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:10,fontFamily:"monospace"}}>
+                <thead>
+                  <tr style={{borderBottom:`1px solid ${C.border}`}}>
+                    {["Regime","Time%","AnnRet","AnnVol","Sharpe","Sortino","Calmar","MaxDD","VaR95","CVaR95","WinRate","AvgWin","AvgLoss","ProfitFactor","Skew"].map(h=><th key={h} style={{padding:"8px 10px",color:C.dimText,fontWeight:400,textAlign:h==="Regime"?"left":"right",fontSize:9,letterSpacing:0.5,whiteSpace:"nowrap"}}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {stats.map(s=>(
+                    <tr key={s.c} style={{borderBottom:`1px solid ${C.border}30`}}>
+                      <td style={{padding:"9px 10px"}}><div style={{display:"flex",alignItems:"center",gap:7}}><Dot color={C.regimes[s.c]} glow size={7}/><div><div style={{color:C.regimes[s.c],fontSize:10,fontWeight:700}}>{REGIME_CHARS[s.c]?.name}</div><div style={{color:C.dimText,fontSize:8}}>{s.count}d</div></div></div></td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.midText}}>{s.pct}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:parseFloat(s.annRet)>=0?C.green:C.red,fontWeight:700}}>{parseFloat(s.annRet)>=0?"+":""}{s.annRet}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.yellow}}>{s.annVol}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:parseFloat(s.sharpe)>=1?C.green:parseFloat(s.sharpe)>=0?C.yellow:C.red,fontWeight:700}}>{s.sharpe}</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:parseFloat(s.sortino)>=1?C.green:parseFloat(s.sortino)>=0?C.yellow:C.red}}>{s.sortino}</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.blue}}>{s.calmar}</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.red}}>{s.maxDD}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.orange}}>{s.var95}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.red}}>{s.cvar95}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.midText}}>{s.winRate}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.green}}>{s.avgWin}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:C.red}}>{s.avgLoss}%</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:parseFloat(s.profitFactor)>=1.5?C.green:C.yellow}}>{s.profitFactor}</td>
+                      <td style={{textAlign:"right",padding:"9px 10px",color:parseFloat(s.skew)>=0?C.blue:C.orange}}>{s.skew}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Panel>
+              <PanelTitle>Sharpe vs Sortino</PanelTitle>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={stats.map(s=>({name:"R"+s.c,sharpe:+s.sharpe,sortino:+s.sortino}))} margin={{top:5,right:5,bottom:0,left:-15}}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="name" tick={{fill:C.dimText,fontSize:9,fontFamily:"monospace"}}/>
+                  <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}}/>
+                  <Tooltip content={<LineTip/>}/>
+                  <ReferenceLine y={0} stroke={C.midText} strokeWidth={1}/>
+                  <ReferenceLine y={1} stroke={C.green} strokeDasharray="3 2" strokeWidth={1} opacity={0.5}/>
+                  <Bar dataKey="sharpe" name="Sharpe" fill={C.blue} opacity={0.8} radius={[3,3,0,0]} isAnimationActive={false}/>
+                  <Bar dataKey="sortino" name="Sortino" fill={C.purple} opacity={0.8} radius={[3,3,0,0]} isAnimationActive={false}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </Panel>
+            <Panel>
+              <PanelTitle>Drawdown and VaR</PanelTitle>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={stats.map(s=>({name:"R"+s.c,maxDD:Math.abs(+s.maxDD),var95:Math.abs(+s.var95),cvar95:Math.abs(+s.cvar95)}))} margin={{top:5,right:5,bottom:0,left:-15}}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="name" tick={{fill:C.dimText,fontSize:9,fontFamily:"monospace"}}/>
+                  <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}} unit="%"/>
+                  <Tooltip content={<LineTip/>}/>
+                  <Bar dataKey="maxDD" name="Max DD" fill={C.red} opacity={0.7} radius={[3,3,0,0]} isAnimationActive={false}/>
+                  <Bar dataKey="var95" name="VaR 95%" fill={C.orange} opacity={0.7} radius={[3,3,0,0]} isAnimationActive={false}/>
+                  <Bar dataKey="cvar95" name="CVaR 95%" fill={C.yellow} opacity={0.5} radius={[3,3,0,0]} isAnimationActive={false}/>
+                </BarChart>
+              </ResponsiveContainer>
+            </Panel>
+          </div>
+        </div>
+      )}
+
+      {tab==="features"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+            <Panel>
+              <PanelTitle right={<Tag label="K-Selection" color={C.yellow}/>}>Elbow Chart</PanelTitle>
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart data={elbow} margin={{top:5,right:5,bottom:0,left:0}}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                  <XAxis dataKey="k" tick={{fill:C.dimText,fontSize:9,fontFamily:"monospace"}}/>
+                  <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}}/>
+                  <Tooltip content={<LineTip/>}/>
+                  <ReferenceLine x={k} stroke={C.yellow} strokeDasharray="3 2" strokeWidth={1.5}/>
+                  <Line type="monotone" dataKey="inertia" name="Inertia" stroke={C.yellow} strokeWidth={2} dot={{fill:C.yellow,r:4}} isAnimationActive={false}/>
+                </LineChart>
+              </ResponsiveContainer>
+              <div style={{fontSize:9,color:C.dimText,marginTop:6}}>Pick K at the elbow where inertia drop flattens. Selected K={k}.</div>
+            </Panel>
+            <Panel>
+              <PanelTitle right={<Tag label="Pearson" color={C.blue}/>}>Feature Correlation Matrix</PanelTitle>
+              {data.length>0&&<CorrHeatmap data={data}/>}
+            </Panel>
+          </div>
+          <Panel>
+            <PanelTitle>Feature Toggle</PanelTitle>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+              {FEAT_KEYS.map((f,i)=>{
+                const active=activeFeats.includes(f);
+                const descs={"return":"Daily log return","vol60":"60d annualized vol","drawdown":"90d max drawdown","mom20":"20d momentum","skewness":"Return skewness","kurtosis":"Excess kurtosis"};
+                return(<div key={f} onClick={()=>toggleFeat(f)} style={{padding:"10px 16px",border:`1px solid ${active?C.yellow:C.border}`,borderRadius:8,cursor:"pointer",background:active?`${C.yellow}15`:"transparent",transition:"all 0.15s",minWidth:120}}><div style={{fontSize:11,color:active?C.yellow:C.midText,fontWeight:700}}>{FEAT_NICE[i]}</div><div style={{fontSize:8,color:C.dimText,marginTop:3}}>{descs[f]}</div><div style={{marginTop:6,fontSize:8,color:active?C.yellow:C.dimText}}>{active?"Active":"Inactive"}</div></div>);
+              })}
+            </div>
+          </Panel>
+          <Panel>
+            <PanelTitle>Feature Variance Contribution per Regime</PanelTitle>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:10}}>
+              {stats.map(s=>{
+                const pts=data.filter(d=>d.regime===s.c);
+                if(!pts.length)return null;
+                const featVars=FEAT_KEYS.map(f=>{const vals=pts.map(d=>d[f]||0);const m=vals.reduce((a,b)=>a+b,0)/vals.length;return{f,v:vals.reduce((a,b)=>a+(b-m)**2,0)/vals.length};});
+                const total=featVars.reduce((a,b)=>a+b.v,0)||1;
+                return(
+                  <div key={s.c} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 12px"}}>
+                    <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:10}}><Dot color={C.regimes[s.c]} glow size={6}/><span style={{fontSize:9,color:C.regimes[s.c],fontWeight:700}}>{REGIME_CHARS[s.c]?.name}</span></div>
+                    {[...featVars].sort((a,b)=>b.v-a.v).map(fv=>(
+                      <div key={fv.f} style={{marginBottom:6}}>
+                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:2}}><span style={{fontSize:8,color:C.dimText}}>{fv.f}</span><span style={{fontSize:8,color:C.midText}}>{(fv.v/total*100).toFixed(1)}%</span></div>
+                        <div style={{height:3,background:C.border,borderRadius:2}}><div style={{height:"100%",background:C.regimes[s.c],borderRadius:2,width:`${fv.v/total*100}%`,opacity:0.8}}/></div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {tab==="backtest"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <Panel>
+            <PanelTitle right={<Tag label="Long/Cash" color={C.green}/>}>Select Regimes to Trade LONG</PanelTitle>
+            <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:12}}>
+              {Array.from({length:k},(_,c)=>{
+                const active=btRegimes.has(c);
+                return(<div key={c} onClick={()=>{setBtRegimes(prev=>{const next=new Set(prev);if(next.has(c))next.delete(c);else next.add(c);return next;});}} style={{padding:"10px 16px",border:`1px solid ${active?C.regimes[c]:C.border}`,borderRadius:8,cursor:"pointer",background:active?`${C.regimes[c]}18`:"transparent",transition:"all 0.15s"}}><div style={{display:"flex",gap:7,alignItems:"center",marginBottom:4}}><Dot color={C.regimes[c]} glow={active} size={7}/><span style={{fontSize:10,color:C.regimes[c],fontWeight:700}}>{REGIME_CHARS[c]?.name}</span></div><div style={{fontSize:8,color:C.dimText}}>SR: {stats[c]?.sharpe||"--"} Ret: {stats[c]?.annRet||"--"}%</div><div style={{marginTop:4,fontSize:9,color:active?C.green:C.dimText}}>{active?"LONG":"CASH"}</div></div>);
+              })}
+            </div>
+            <div style={{fontSize:9,color:C.dimText}}>Long selected regimes. Cash earns 0.008%/day. No slippage or costs.</div>
+          </Panel>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10}}>
+            <StatCell label="Strategy Return" value={`${btFinal}%`} color={parseFloat(btFinal)>=0?C.green:C.red}/>
+            <StatCell label="Buy and Hold" value={`${bhFinal}%`} color={C.midText}/>
+            <StatCell label="Alpha" value={`${alpha}%`} color={C.blue}/>
+            <StatCell label="Active Regimes" value={btRegimes.size} sub={`of ${k} total`}/>
+          </div>
+          <Panel>
+            <PanelTitle>Strategy vs Buy and Hold</PanelTitle>
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={btResults} margin={{top:5,right:5,bottom:0,left:-10}}>
+                <CartesianGrid strokeDasharray="2 4" stroke={C.border}/>
+                <XAxis dataKey="date" tick={false}/>
+                <YAxis tick={{fill:C.dimText,fontSize:8,fontFamily:"monospace"}} unit="%"/>
+                <Tooltip content={<LineTip/>}/>
+                <ReferenceLine y={0} stroke={C.midText} strokeWidth={1}/>
+                <Line type="monotone" dataKey="strategy" name="Regime Strategy" stroke={C.green} strokeWidth={2} dot={false} isAnimationActive={false}/>
+                <Line type="monotone" dataKey="buyhold" name="Buy and Hold" stroke={C.midText} strokeWidth={1.5} dot={false} strokeDasharray="4 3" isAnimationActive={false}/>
+              </LineChart>
+            </ResponsiveContainer>
+          </Panel>
+        </div>
+      )}
+
+      {tab==="ai"&&(
+        <div style={{display:"flex",flexDirection:"column",gap:16}}>
+          <Panel>
+            <PanelTitle right={<Tag label="Groq API" color={C.purple}/>}>AI Configuration</PanelTitle>
+            <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:12,marginBottom:14}}>
+              <div>
+                <div style={{fontSize:9,color:C.dimText,marginBottom:5,letterSpacing:1}}>GROQ API KEY — free at console.groq.com</div>
+                <input type="password" value={groqKey} onChange={e=>setGroqKey(e.target.value)} placeholder="gsk_xxxxxxxxxxxxxxxxxxxx" style={{width:"100%",background:C.surface,border:`1px solid ${groqKey?C.purple:C.border}`,borderRadius:6,padding:"8px 12px",color:C.hiText,fontSize:11,fontFamily:"monospace",outline:"none",boxSizing:"border-box"}}/>
+              </div>
+              <div>
+                <div style={{fontSize:9,color:C.dimText,marginBottom:5,letterSpacing:1}}>MODEL</div>
+                <select value={groqModel} onChange={e=>setGroqModel(e.target.value)} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:6,padding:"8px 12px",color:C.bodyText,fontSize:10,fontFamily:"monospace",outline:"none"}}>
+                  {GROQ_MODELS.map(m=><option key={m.id} value={m.id}>{m.label}</option>)}
+                </select>
+              </div>
+            </div>
+            <div style={{fontSize:9,color:C.dimText,marginBottom:8}}>Quick Prompts:</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {[
+                {label:"Full Regime Report",p:"Give me a complete regime characterization. For each regime: market character, risk profile, alpha opportunities, position sizing guidance."},
+                {label:"Transition Signals",p:"Based on the transition matrix, what early-warning signals should I monitor to predict regime changes?"},
+                {label:"Risk Deep Dive",p:"Deep risk analysis: which regime has the greatest tail risk? How to adjust hedging across regimes?"},
+                {label:"Strategy Design",p:"Design an optimal regime-aware systematic trading strategy with entry/exit rules, position sizing, and risk controls."},
+                {label:"HMM vs K-Means",p:"Compare Hidden Markov Models vs K-Means for this dataset. Tradeoffs for live trading?"},
+              ].map(q=><button key={q.label} onClick={()=>sendAI(q.p)} disabled={aiLoading||!groqKey} style={{padding:"6px 12px",border:`1px solid ${C.purple}40`,borderRadius:5,background:`${C.purple}10`,color:C.purple,cursor:groqKey&&!aiLoading?"pointer":"not-allowed",fontSize:9,fontFamily:"monospace",opacity:groqKey&&!aiLoading?1:0.4,transition:"all 0.15s"}}>{q.label}</button>)}
+            </div>
+          </Panel>
+          <Panel>
+            <PanelTitle>Quant AI Conversation</PanelTitle>
+            <div ref={chatRef} style={{height:380,overflowY:"auto",marginBottom:12,display:"flex",flexDirection:"column",gap:12}}>
+              {aiMessages.length===0&&<div style={{padding:24,textAlign:"center",color:C.dimText,fontSize:11}}>Enter Groq API key and use a preset prompt or type your own quant question.<br/><span style={{fontSize:9,display:"block",marginTop:8}}>Full regime context ({k} regimes, {data.length}d, {asset}) sent automatically.</span></div>}
+              {aiMessages.map((m,i)=>(
+                <div key={i} style={{display:"flex",gap:10,flexDirection:m.role==="user"?"row-reverse":"row"}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",flexShrink:0,background:m.role==="user"?`${C.blue}30`:`${C.purple}30`,border:`1px solid ${m.role==="user"?C.blue:C.purple}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:m.role==="user"?C.blue:C.purple}}>{m.role==="user"?"U":"AI"}</div>
+                  <div style={{maxWidth:"80%",padding:"10px 14px",borderRadius:8,fontSize:10,lineHeight:1.7,background:m.role==="user"?`${C.blue}12`:`${C.purple}10`,border:`1px solid ${m.role==="user"?C.blue+"30":C.purple+"30"}`,color:C.bodyText,whiteSpace:"pre-wrap",fontFamily:"monospace"}}>{m.content}</div>
+                </div>
+              ))}
+              {aiLoading&&(
+                <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+                  <div style={{width:28,height:28,borderRadius:"50%",background:`${C.purple}30`,border:`1px solid ${C.purple}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:C.purple}}>AI</div>
+                  <div style={{padding:"10px 14px",background:`${C.purple}10`,border:`1px solid ${C.purple}30`,borderRadius:8,display:"flex",gap:4,alignItems:"center"}}>
+                    {[0,1,2].map(i=><div key={i} style={{width:6,height:6,borderRadius:"50%",background:C.purple,animation:`bounce 0.8s ${i*0.15}s infinite`}}/>)}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <input value={aiInput} onChange={e=>setAiInput(e.target.value)} onKeyDown={e=>e.key==="Enter"&&!e.shiftKey&&aiInput.trim()&&sendAI(aiInput)} placeholder="Ask about regime dynamics, risk, strategy..." disabled={aiLoading||!groqKey} style={{flex:1,background:C.surface,border:`1px solid ${C.border}`,borderRadius:6,padding:"9px 14px",color:C.hiText,fontSize:11,fontFamily:"monospace",outline:"none"}}/>
+              <button onClick={()=>aiInput.trim()&&sendAI(aiInput)} disabled={aiLoading||!groqKey||!aiInput.trim()} style={{padding:"9px 18px",border:`1px solid ${C.purple}`,borderRadius:6,background:`${C.purple}20`,color:C.purple,cursor:"pointer",fontSize:11,fontFamily:"monospace",opacity:aiLoading||!groqKey||!aiInput.trim()?0.4:1}}>Send</button>
+              {aiMessages.length>0&&<button onClick={()=>setAiMessages([])} style={{padding:"9px 12px",border:`1px solid ${C.border}`,borderRadius:6,background:"transparent",color:C.dimText,cursor:"pointer",fontSize:10,fontFamily:"monospace"}}>Clear</button>}
+            </div>
+          </Panel>
+        </div>
+      )}
+      </>
+    )}
+  </div>
+  <style>{`
+    @keyframes bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}
+    @keyframes slide{0%{transform:translateX(-200%)}100%{transform:translateX(400%)}}
+    ::-webkit-scrollbar{width:4px;height:4px}
+    ::-webkit-scrollbar-track{background:#050810}
+    ::-webkit-scrollbar-thumb{background:#131E35;border-radius:2px}
+    input::placeholder{color:#2E4870}
+    select option{background:#0B1221;color:#8AABCC}
+    *{box-sizing:border-box}
+  `}</style>
+</div>
+```
+
+);
+}
